@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/
+.venv/
+venv/
+
+# 未使用的孤立 FFmpeg 二进制（与任何 @ffmpeg/core 版本不匹配）
+wasm/ffmpeg/

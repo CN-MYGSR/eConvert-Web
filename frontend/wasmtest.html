@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>eConvert WASM test harness</title>
+</head>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+const out = document.getElementById("out");
+const lines = [];
+function log(m) { lines.push(m); out.textContent = lines.join("\n"); }
+
+try {
+await main();
+log("ALL DONE");
+document.title = "wasmtest PASS";
+} catch (err) {
+log("FATAL: " + (err && err.stack ? err.stack : String(err)));
+document.title = "wasmtest FAIL";
+}
+
+async function main() {
+
+function bufToB64(buf) {
+  let bin = "";
+  for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+  return btoa(bin);
+}
+
+function makeWav() {
+  const rate = 44100, n = rate; // 1s 440Hz 16-bit mono
+  const dataLen = n * 2;
+  const buf = new ArrayBuffer(44 + dataLen);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + dataLen, true); w(8, "WAVE");
+  w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, "data"); v.setUint32(40, dataLen, true);
+  for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.sin((i / rate) * 440 * 2 * Math.PI) * 8000, true);
+  return new Uint8Array(buf);
+}
+
+function makePdf(text) {
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+    null, // stream
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  const stream = `BT /F1 12 Tf 50 100 Td (${text}) Tj ET`;
+  objects[3] = `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`;
+  let pdf = "%PDF-1.4\n";
+  const offsets = [];
+  for (let i = 0; i < objects.length; i++) {
+    offsets.push(pdf.length);
+    pdf += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+  }
+  const xrefPos = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const off of offsets) pdf += String(off).padStart(10, "0") + " 00000 n \n";
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF\n`;
+  return new TextEncoder().encode(pdf);
+}
+
+/* ---------- 1. Pyodide via the REAL worker ---------- */
+
+log("worker: creating…");
+const worker = new Worker("/js/wasm-worker.js");
+const pyCall = (type, payload, transfer, timeoutMs) => new Promise((resolve, reject) => {
+  const id = Math.floor(Math.random() * 1e9);
+  const timer = setTimeout(() => {
+    worker.removeEventListener("message", onMsg);
+    reject(new Error("worker call timed out after " + timeoutMs + "ms"));
+  }, timeoutMs || 600000);
+  const onMsg = (e) => {
+    if (e.data.id !== id) return;
+    if (e.data.type === "progress") { log("worker: pdf page " + e.data.p + "/" + e.data.t); return; }
+    if (e.data.type === "init-progress") { log("worker: " + e.data.msg); return; }
+    clearTimeout(timer);
+    worker.removeEventListener("message", onMsg);
+    if (e.data.ok) resolve(e.data); else reject(new Error(e.data.error));
+  };
+  worker.addEventListener("message", onMsg);
+  worker.postMessage({ id, type, payload }, transfer);
+});
+
+log("worker: init pyodide (pillow + pdfminer + docx)…");
+await pyCall("init", { codeUrl: "/wasm/py/converters.py" }, undefined, 300000);
+log("worker: pyodide ready");
+
+const canvas = document.createElement("canvas");
+canvas.width = 64; canvas.height = 64;
+const ctx = canvas.getContext("2d");
+ctx.fillStyle = "#0078D4"; ctx.fillRect(0, 0, 64, 64);
+ctx.fillStyle = "#fff"; ctx.font = "32px sans-serif"; ctx.fillText("e", 18, 44);
+const pngBlob = await new Promise((r) => canvas.toBlob(r, "image/png"));
+const pngBuf = new Uint8Array(await pngBlob.arrayBuffer());
+
+const r1 = await pyCall("convert", {
+  page: "image", name: "t.png", target: "JPG",
+  settings: { image_quality: 90 }, buf: pngBuf.buffer,
+}, [pngBuf.buffer]);
+const jpg = Uint8Array.from(atob(r1.data), (c) => c.charCodeAt(0));
+log("image t.png->JPG: " + jpg.length + "B magic=" + [jpg[0], jpg[1]].map((b) => b.toString(16)).join(""));
+
+const r2 = await pyCall("convert", {
+  page: "pdf", name: "t.pdf", target: "docx",
+  settings: {}, buf: makePdf("Hello WASM PDF").buffer,
+}, [makePdf("Hello WASM PDF").buffer]);
+const docx = Uint8Array.from(atob(r2.data), (c) => c.charCodeAt(0));
+log("pdf t.pdf->DOCX: " + docx.length + "B magic=" + [docx[0], docx[1]].map((b) => b.toString(16)).join(""));
+
+/* ---------- 2. FFmpeg.wasm ---------- */
+
+log("ffmpeg: loading core…");
+const { FFmpeg } = await import("/vendor/ffmpeg/esm/index.js");
+const { buildAudioArgs, buildVideoArgs, buildGifArgs } = await import("/js/wasm-core.js");
+const ffmpeg = new FFmpeg();
+ffmpeg.on("log", ({ message }) => { if (/error/i.test(message)) log("ffmpeg stderr: " + message.slice(0, 120)); });
+const t0 = Date.now();
+await ffmpeg.load({ coreURL: "/vendor/ffmpeg/core/ffmpeg-core.esm.js" });
+log("ffmpeg: core loaded (" + (Date.now() - t0) + "ms)");
+
+async function run(name, args, outFile) {
+  try {
+    await ffmpeg.exec(args);
+  } catch (e) {
+    log("!! " + name + " exec FAILED: " + String(e).slice(0, 200) + "\n    args=" + JSON.stringify(args));
+    return;
+  }
+  let data;
+  try {
+    data = await ffmpeg.readFile(outFile);
+  } catch (e) {
+    log("!! " + name + " readFile FAILED: " + String(e).slice(0, 200));
+    return;
+  }
+  const b = new Uint8Array(data.buffer, data.byteOffset, Math.min(8, data.byteLength));
+  log(name + ": " + data.byteLength + "B magic=" + Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join(" "));
+}
+
+ffmpeg.writeFile("in.wav", makeWav());
+await run("audio wav->MP3 vol120",
+  buildAudioArgs("in.wav", "MP3", { volume: 120, rate: 44100 }, "out.mp3"), "out.mp3");
+await run("audio wav->FLAC",
+  buildAudioArgs("in.wav", "FLAC", { volume: 100, rate: 0 }, "out.flac"), "out.flac");
+await run("audio wav->OGG vol80",
+  buildAudioArgs("in.wav", "OGG", { volume: 80, rate: 22050 }, "out.ogg"), "out.ogg");
+await run("audio wav->OPUS",
+  buildAudioArgs("in.wav", "OPUS", { volume: 100, rate: 48000 }, "out.opus"), "out.opus");
+await run("audio wav->M4A",
+  buildAudioArgs("in.wav", "M4A", { volume: 100, rate: 0 }, "out.m4a"), "out.m4a");
+
+log("ffmpeg: generating test clip…");
+await ffmpeg.exec(["-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=10",
+  "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+  "-c:v", "libx264", "-c:a", "aac", "-shortest", "-y", "in.mp4"]);
+await run("video mp4->MP4 h264 crf20 h120 fps10",
+  buildVideoArgs("in.mp4", "MP4", { crf: 20, height: 120, fps: 10, codec: "h264", volume: 100, rate: 0 }, "out.mp4"), "out.mp4");
+await run("video mp4->WEBM",
+  buildVideoArgs("in.mp4", "WEBM", { crf: 20, height: 0, fps: 10, codec: "h264", volume: 100, rate: 0 }, "out.webm"), "out.webm");
+await run("video mp4->MKV h265",
+  buildVideoArgs("in.mp4", "MKV", { crf: 26, height: 0, fps: 10, codec: "h265", volume: 100, rate: 0 }, "out.mkv"), "out.mkv");
+await run("video mp4->GIF",
+  buildGifArgs("in.mp4", { fps: 8 }, "out.gif"), "out.gif");
+
+} /* main */
+</script>
+</body>
+</html>

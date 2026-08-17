@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+pdf2docx>=0.5.8
+pydub>=0.25.1
+Pillow>=10.4
+moviepy>=2.0
